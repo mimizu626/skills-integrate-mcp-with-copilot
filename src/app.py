@@ -5,14 +5,91 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+import hashlib
+import hmac
+import json
 import os
 from pathlib import Path
+import secrets
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET") or secrets.token_urlsafe(32),
+    same_site="lax",
+    https_only=os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true",
+)
+
+TEACHER_CREDENTIALS_PATH = Path(__file__).with_name("teachers.json")
+
+
+class TeacherLogin(BaseModel):
+    username: str
+    password: str
+
+
+def verify_password(password, password_hash):
+    try:
+        algorithm, iterations, salt, expected_digest = password_hash.split("$", 3)
+        iterations = int(iterations)
+        if algorithm != "pbkdf2_sha256" or not 100000 <= iterations <= 1000000:
+            return False
+        actual_digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt.encode(), iterations
+        ).hex()
+        return hmac.compare_digest(actual_digest, expected_digest)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def require_teacher(request: Request):
+    username = request.session.get("teacher_username")
+    if not username:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
+
+
+@app.get("/auth/session")
+def get_auth_session(request: Request):
+    username = request.session.get("teacher_username")
+    return {"authenticated": bool(username), "username": username}
+
+
+@app.post("/auth/login")
+def login_teacher(credentials: TeacherLogin, request: Request):
+    try:
+        with TEACHER_CREDENTIALS_PATH.open(encoding="utf-8") as credentials_file:
+            teacher_records = json.load(credentials_file)["teachers"]
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail="No teacher accounts configured. Run python src/add_teacher.py",
+        )
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Teacher credentials are unavailable")
+
+    teacher = next(
+        (record for record in teacher_records
+         if record.get("username") == credentials.username),
+        None,
+    )
+    if not teacher or not verify_password(credentials.password, teacher.get("password_hash")):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    request.session["teacher_username"] = credentials.username
+    return {"authenticated": True, "username": credentials.username}
+
+
+@app.post("/auth/logout")
+def logout_teacher(request: Request):
+    request.session.clear()
+    return {"authenticated": False}
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -89,7 +166,11 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    teacher_username: str = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +192,11 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    teacher_username: str = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
